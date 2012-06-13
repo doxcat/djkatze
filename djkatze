@@ -1,0 +1,402 @@
+#!/usr/bin/perl -T
+
+use strict;
+use warnings;
+use diagnostics;
+use Time::Duration;
+use HTML::TreeBuilder::Select;
+use Data::Dumper;
+use Carp;
+use WebService::GData::YouTube;
+use Bone::Easy;
+use IRC::Utils qw(:ALL);
+use WWW::Mechanize;
+use Google::Search;
+use Algorithm::MarkovChain;
+use Text::Truncate;
+use Net::Twitter;
+use Acme::LOLCAT;
+
+my $mech = WWW::Mechanize->new;
+my $twitter = {
+	consumer_key => '',
+	consumer_secret => '',
+	access_token => '',
+	access_token_secret => '',
+};
+my $nt = Net::Twitter->new( #create new Net::Twitter instance
+        traits => [qw/OAuth API::REST/], #use OAuth and REST API
+	consumer_key => $twitter->{consumer_key},
+	consumer_secret => $twitter->{consumer_secret},
+	access_token => $twitter->{access_token},
+	access_token_secret => $twitter->{access_token_secret},
+);
+
+sub get_tweet {
+	my $username = shift;
+	my $msg;
+	my $q;
+	eval { 
+		$q = $nt->user_timeline({id => $username, count => 1});
+	};
+	if($@ or $q->[0]->{text} eq "") {
+		my $error = $@;
+		$error =~ s/at djkatze line \d+//gi;
+		$error = "User $username doesn't exist." if $error =~ /that page does not exist/;
+		$error = translate("I suck at finding tweets for $username") if $q->[0]->{text} eq "";
+		$msg = "Error: $error";
+	} else {
+		$msg = "@".BOLD.GREY.$username.NORMAL.": " . $q->[0]->{text};
+	}
+	return $msg;
+}
+
+sub google {
+	my($q, $constraint, $limit, $urlonly) = @_;
+	$constraint ||= "web";
+	$limit ||= 1;	
+	$urlonly ||= 0;
+	my $map = {
+		web => "Web",
+		vid => "Video",
+		video => "Video",
+		blog => "Blog",
+		news => "News",
+		book => "Book",
+		img => "Image",
+		patent => "Patent",
+	};
+	my $query;
+	$constraint =~ s/^_//;
+	my $method;
+	foreach my $c(keys %$map) {
+		if(index($c,$constraint) == 0) {
+			$method = $map->{$c};
+		}
+	}
+	if($method) {
+		$query = Google::Search->$method($q);
+	} else {
+		return "Search constraint not found: $constraint.";
+	}
+	my @list = splice(@{$query->all},0,$limit);
+	my $res = $list[int rand($#list)];
+	my $msg;
+	if(defined $res) {
+		if($urlonly) {
+			$msg = $res->uri->as_string;
+		} else {
+			$msg = "Result for $q: ".$res->uri->as_string . " (".($res->titleNoFormatting).")";
+		}
+	} else {
+		$msg = "Nothing found for $q.";
+	}
+	return $msg;
+}
+
+sub random_yt {
+	my $nick = shift;
+	my $yt = new WebService::GData::YouTube();
+	my @videos;
+	push @videos, @{$yt->get_top_rated_videos};
+	push @videos, @{$yt->get_top_favorites_videos};
+	push @videos, @{$yt->get_most_viewed_videos};
+	push @videos, @{$yt->get_most_shared_videos};
+	push @videos, @{$yt->get_most_popular_videos};
+	push @videos, @{$yt->get_most_recent_videos};
+	push @videos, @{$yt->get_most_discussed_videos};
+	push @videos, @{$yt->get_most_responded_videos};
+	push @videos, @{$yt->get_recently_featured_videos};
+	push @videos, @{$yt->get_on_the_web_videos};
+	my $video = $videos[int rand $#videos];
+	my $msg = "$nick: ".BOLD.$video->title.NORMAL." by ".$video->uploader." (".duration($video->duration).") - http://youtu.be/".$video->video_id." (+".$video->rating->{numLikes}.", -".$video->rating->{numDislikes}.") ".$video->view_count." views.";
+	return $msg;
+}
+
+sub yt {
+        my ($q, $nick, $limit) = @_;
+	$limit ||= 10;
+	if($q =~ /(my little pony|mlp|brittany spears)/i) {
+		return "GAY";
+	}
+        my $yt = new WebService::GData::YouTube();
+        my $ytsearch = $yt->query;
+        $ytsearch->q($q)->limit($limit,0);
+        my $videos = $yt->search_video();
+	my $video;
+	if($limit == 1) {
+		$video = shift @$videos;
+	} else {
+		$video = $videos->[int(rand() * scalar(@{$videos}))];
+	}
+	my $msg;
+	if(!defined $video) {
+		$msg = "No videos found.";
+	} else {	
+		$msg = "$nick: ".BOLD.$video->title.NORMAL." by ".$video->uploader." (".duration($video->duration).") - http://youtu.be/".$video->video_id." (+".$video->rating->{numLikes}.", -".$video->rating->{numDislikes}.") ".$video->view_count." views.";
+	}
+	return $msg;
+}
+
+#sub sed {
+#	my ($msg, $match, $replace, $flag, $nick) = @_;
+#	if(lc $flag =~ /g/) {
+#		if(lc $flag =~ /i/) {
+#			$msg =~ s/$match/$replace/gi;
+#		} else {
+#			$msg =~ s/$match/$replace/g
+#	} elsif(lc $flag =~ /i/) {
+#		$msg =~ s/$match/$replace/i;
+#	}
+#}
+
+
+BEGIN {
+	if(-f "/tmp/djkatze") {
+		open my $pfile, "</tmp/djkatze";
+		my $p = <$pfile>;
+		print "djkatze is already running under pid: $p\n";
+		exit;
+		close $pfile;
+	}
+	open my $pfile, ">/tmp/djkatze";
+	print $pfile $$;
+	close $pfile;
+}
+END 
+{
+	unlink "/tmp/djkatze";
+}
+use POE qw(Component::IRC::State);
+
+sub interrupt {
+	$SIG{INT} = \&interrupt;
+	unlink "/tmp/djkatze";
+	exit;
+}
+
+$SIG{INT} = \&interrupt;
+our $mentions = {};
+my @mention_queue;
+
+my $nick = "DJKatze";
+my $ircname = "DJ Katze";
+my $server = "irc.wtfux.org";
+my $irc = POE::Component::IRC::State->spawn(
+	nick => $nick,
+	ircname => $ircname,
+	username => 'wubwubwubwubwub',
+	server => $server
+) or die "oh shit $!";
+POE::Session->create(
+	package_states => [
+		main => [ qw(_start irc_001 irc_public _default) ],
+	],
+	inline_states => {
+		#check_twitter => \&check_twitter,
+		#push_updates => \&push_updates,
+		#mock_stuff => \&mock_stuff,
+	},
+	heap => { irc => $irc, last => 0 },
+);
+$poe_kernel->run();
+
+#sub check_twitter {
+#	my $kernel = $_[KERNEL]; 
+#	my $m = $nt->mentions;
+#	print $f Dumper($m);
+#	close $f;
+#	foreach my $mn (@$m) {
+#		if(!defined $mentions->{$mn->{id}}) {
+#			$mentions->{$mn->{id}} = 1;
+#			push @mention_queue, $mn;
+#		}	
+#	}
+#	$kernel->delay("check_twitter",30);
+#	return;
+#}
+
+sub push_updates {
+	my $kernel = $_[KERNEL];
+	my $heap = $_[HEAP];
+	$kernel->delay("push_updates",5);
+	return if !scalar @mention_queue;
+	my $irc = $heap->{irc};
+	my $i = 0;
+	while(scalar @mention_queue and $i < 3) {	
+		return if $i == 3;
+		my $mn = shift @mention_queue;
+		my $msg = "<".BOLD.RED."@".NORMAL.BOLD.$mn->{user}->{screen_name}.NORMAL."> ".$mn->{text};
+		$irc->yield(privmsg => "#Dubstep" => $msg);
+		$i++;
+	}
+}
+
+
+#sub post_tweet {
+#	my ($nick,$msg) = @_;
+#	my $update = truncstr("<$nick> $msg",140);
+#	eval {
+#		$nt->update({status => $update});	
+#	};
+#	return $@?-1:1;
+#}
+sub _start {
+	my $heap = $_[HEAP];
+	my $kernel = $_[KERNEL]; 
+	my $irc = $heap->{irc};
+	$irc->yield(register => 'all');
+	$irc->yield(connect => { } );
+	my $pass = "changeme";
+	$irc->yield(nickserv => "ghost DJKatze $pass");
+	$irc->yield(nickserv => "identify $pass");
+	#$kernel->delay("check_twitter",30);
+	#$kernel->delay("push_updates",1);
+	#$kernel->delay("mock_stuff" => 1);
+	return;
+}
+sub irc_001 {
+	my $irc = $_[HEAP]->{irc};
+	$irc->yield( join => "#Dubstep");
+	return;
+}
+sub irc_public {
+        my ($sender, $who, $where, $what, $auth) = @_[SENDER, ARG0 .. ARG2, ARG3];
+	my $heap = $_[HEAP];
+        my $nick = ( split /\!/, $who)[0];
+	if($what =~ /^dub (.+)/i) {
+		my $q = yt($1." dubstep",$nick,1);
+		if($q eq "GAY") {
+			$irc->yield(kick => "#Dubstep" => $nick => "y u so?");
+			return;
+		}	
+		$irc->yield(privmsg => "#Dubstep" => $q);
+	} elsif($what =~ /^yt (.+)/) {
+		my $q = yt($1,$nick);
+		if($q eq "GAY") {
+			$irc->yield(kick => "#Dubstep" => $nick => "y u so?");
+			return;
+		}	
+		$irc->yield(privmsg => "#Dubstep" => $q);
+		return;
+	} elsif($what =~ /^!random/) {
+		$irc->yield(privmsg => "#Dubstep" => random_yt($nick));
+		return;
+	} elsif($what =~ /^!pickup/) {
+		$irc->yield(privmsg => "#Dubstep" => pickup);
+		return;
+	} elsif($what =~ /^(http:\/\/.+)/i) {
+		my $msg = get_title($1);
+		$irc->yield(privmsg => "#Dubstep" => $msg);
+		return;
+	} elsif($what =~ /^!google(_.+)? (.+)/i || $what =~ /^!g(\w+)? (.+)/i) {
+		my $msg = google($2,$1);
+		$irc->yield(privmsg => "#Dubstep" => $msg);
+		return;
+	} elsif( $what =~ /^@([a-z0-9_]+)/) {
+		my $msg = get_tweet($1);
+		$irc->yield(privmsg => "#Dubstep" => $msg);
+		return;
+	} elsif($what =~ /^!mock( (.+))?/) {
+		my $msg = mock($2);
+		$irc->yield(privmsg => "#Dubstep" => $msg);
+		return;
+	} elsif($what =~ /^!tweet (.+)/) {
+		$irc->yield(privmsg => "#Dubstep" => "disabled because fuck you");
+		return;
+		#my $tweet = $1;
+		#my $t = post_tweet($nick,$1);
+		#if($t == -1) {
+		#	$irc->yield(privmsg => "#Dubstep" => "da t00bs gave me an error sumwar");
+		#} else {
+		#	$irc->yield(privmsg => "#Dubstep" => "Posted.");
+		#}
+		#return;
+	}
+	if(time - $heap->{last} < 30) { return; }
+        my $channel = $where->[0];
+	my $rand = int(rand(25)+5);
+	my $str = "WUB "x$rand;
+	$irc->yield(privmsg => "#Dubstep" => $str) if rand > 0.5;
+	$heap->{last} = time;
+}
+
+sub mock {
+	my $key = shift;
+	$key = "news" if !defined $key;
+	my $limit = shift;
+	$limit = 25 if !defined $limit;
+	my $art = shift;
+	$art = 50 if !defined $art;
+	my $q = google($key,"news",$art,1);
+	my $lol = shift;
+	$lol = 0 if !defined $lol;
+	eval {
+		$mech->get($q);
+	};
+	if($@) {
+		return translate("sorry, can't find anything to mock about $key");
+	}
+	
+	my $html;
+	$html = $mech->content();
+	my $tree = HTML::TreeBuilder::Select->new;;
+	$tree->parse($html);
+	$tree->eof;
+	my @a = $tree->select("a");
+	map { $_->delete() } @a;
+	my $text = $tree->as_text;
+	my $chain = Algorithm::MarkovChain->new();
+	my @symbols = split /\s/, $text;
+	@symbols = grep { $_ ne "" and length $_ < 8 } @symbols;
+	$chain->seed(symbols => \@symbols);
+	my @spew = $chain->spew(length => (int rand($limit)+5));
+	my $ret = return join(" ",@spew).".";
+	if($lol) { $ret = translate($ret); }
+	return $ret;
+}
+
+sub get_title {
+	my $url = shift;
+	my $title;
+	eval {
+		$mech->get($url);
+		$title = $mech->title;
+	};
+	my $msg;
+	if($@) {
+		my $error = $@;
+		$error =~ s/at.+line \d+//gi;
+		$msg = "Error: " . $error;
+	} elsif(!defined $title) {
+		$msg = "No title found.";
+	} else {
+		$msg = "Title: $title";
+	}
+	return $msg;
+}
+
+sub _default {
+     my ($event, $args) = @_[ARG0 .. $#_];
+     my @output = ( "$event: " );
+
+     for my $arg (@$args) {
+         if ( ref $arg eq 'ARRAY' ) {
+             push( @output, '[' . join(', ', @$arg ) . ']' );
+         }
+         else {
+             push ( @output, "'$arg'" );
+         }
+     }
+     print join ' ', @output, "\n";
+     return;
+
+}
+
+
+#sub mock_stuff {
+#	my $kernel = $_[KERNEL];
+#	$nt->update({status => truncstr(lc(translate(mock("usa",30,500))),130)." #markov"});
+#	$kernel->delay("mock_stuff" => (int(rand(30)+30))*60);
+#}
+exit;
